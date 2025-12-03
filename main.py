@@ -1,251 +1,218 @@
-import re
-import csv
-import io
+"""
+streamlit_app.py
+
+Streamlit UI for manual review + dynamic regex pattern additions for the
+DataPipeline (loader -> classifier -> anonymizer).
+
+Usage:
+    streamlit run streamlit_app.py
+
+Assumes: data_pipeline.py is in same directory and defines DataPipeline and default_regex_patterns.
+"""
+
+import streamlit as st
+import tempfile
 import json
-import spacy
-import gradio as gr
-from spacy.tokens import Doc
-from spacy.language import Language
-from presidio_analyzer import AnalyzerEngine, RecognizerRegistry, PatternRecognizer, RecognizerResult
-from presidio_anonymizer import AnonymizerEngine
-from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import letter
+import os
+from pathlib import Path
+from typing import List
 
-# -------------------------------------------------------------------------------------
-# Load SpaCy Model
-# -------------------------------------------------------------------------------------
+# Import your pipeline (ensure data_pipeline.py is accessible)
+from data_pipeline import DataPipeline, default_regex_patterns
 
-try:
-    nlp = spacy.load("en_core_web_lg")
-except:
-    nlp = spacy.load("en_core_web_sm")
+st.set_page_config(page_title="PII Data Pipeline Demo", layout="wide")
 
-# Add pipeline component
-if "ner" not in nlp.pipe_names:
-    ner = nlp.create_pipe("ner")
-    nlp.add_pipe(ner)
+# --------------------------
+# Helpers
+# --------------------------
+@st.cache_resource
+def get_pipeline(output_dir: str = None, chunk_size: int = 1500, chunk_overlap: int = 200):
+    p = DataPipeline(chunk_size=chunk_size, chunk_overlap=chunk_overlap, output_dir=output_dir)
+    # Register default detectors and anonymizers
+    p.register_regex_patterns(default_regex_patterns.copy())
+    p.register_spacy("en_core_web_sm")
+    p.register_presidio()
+    p.register_ml()  # placeholder
+    return p
 
-# Required PII Labels mapping
-PII_LABELS = {
-    "PERSON": "PERSON",
-    "EMAIL_ADDRESS": "EMAIL",
-    "PHONE_NUMBER": "PHONE",
-    "LOCATION": "LOCATION",
-    "ORG": "ORGANIZATION",
-}
+def save_uploaded_file(uploaded_file, dst_folder):
+    dst = Path(dst_folder) / uploaded_file.name
+    with open(dst, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+    return str(dst)
 
-# Configure Analyzer + Anonymizer
-analyzer = AnalyzerEngine()
-anonymizer = AnonymizerEngine()
+def make_download_link(text: str, filename: str):
+    b = text.encode('utf-8')
+    return st.download_button(label=f"Download {filename}", data=b, file_name=filename, mime="text/plain")
 
-# -------------------------------------------------------------------------------------
-# Custom Recognizer for Regex
-# -------------------------------------------------------------------------------------
+# --------------------------
+# Sidebar: settings + pattern editor
+# --------------------------
+st.sidebar.header("Pipeline Settings")
+out_dir = st.sidebar.text_input("Output dir (local)", value="./st_pipeline_out")
+chunk_size = st.sidebar.number_input("Chunk size", value=1500, min_value=500, step=100)
+chunk_overlap = st.sidebar.number_input("Chunk overlap", value=200, min_value=0, step=50)
+ensure = Path(out_dir)
+ensure.mkdir(parents=True, exist_ok=True)
 
-def build_custom_regex_recognizer(patterns):
-    if not patterns:
-        return None
+st.sidebar.markdown("---")
+st.sidebar.header("Regex Patterns (live)")
 
-    try:
-        return PatternRecognizer(
-            supported_entity="CUSTOM_PII",
-            patterns=[{"name": "custom_pattern", "regex": patterns, "score": 0.85}]
-        )
-    except Exception:
-        return None
+# Keep patterns in session_state
+if "regex_patterns" not in st.session_state:
+    st.session_state.regex_patterns = default_regex_patterns.copy()
 
+# Show current patterns
+with st.sidebar.expander("Current Patterns", expanded=True):
+    for k, v in st.session_state.regex_patterns.items():
+        st.text_input(f"Pattern: {k}", value=v, key=f"pattern_{k}")
 
-# -------------------------------------------------------------------------------------
-# Helper: Detect PII
-# -------------------------------------------------------------------------------------
+# Add new pattern
+st.sidebar.markdown("Add new regex pattern")
+new_label = st.sidebar.text_input("Label (e.g., SSN)")
+new_pattern = st.sidebar.text_input("Pattern (Python regex)")
+if st.sidebar.button("Add pattern"):
+    if new_label and new_pattern:
+        st.session_state.regex_patterns[new_label] = new_pattern
+        st.success(f"Added pattern: {new_label}")
+    else:
+        st.sidebar.error("Provide both label and pattern.")
 
-def detect_pii(text, custom_regex=None):
-    registry = RecognizerRegistry()
-    registry.load_predefined_recognizers()
+if st.sidebar.button("Reset to defaults"):
+    st.session_state.regex_patterns = default_regex_patterns.copy()
+    st.sidebar.success("Reset to default patterns (session only).")
 
-    if custom_regex:
-        custom_recog = build_custom_regex_recognizer(custom_regex)
-        if custom_recog:
-            registry.add_recognizer(custom_recog)
+st.sidebar.markdown("---")
+st.sidebar.write("Click **Run pipeline** on the main page after uploading files.")
 
-    custom_analyzer = AnalyzerEngine(registry=registry)
+# --------------------------
+# Main UI
+# --------------------------
+st.title("PII Detection & Anonymization — Demo UI")
+st.markdown(
+    """
+    Upload files or provide local file paths. The pipeline will:
+    1. Load files lazily (PDF/CSV/JSON/IMG/TXT/EML)
+    2. Chunk text
+    3. Run Regex / spaCy / Presidio / ML detectors
+    4. Produce anonymized outputs (per anonymizer)
+    """
+)
 
-    results = custom_analyzer.analyze(
-        text=text,
-        entities=["PERSON", "EMAIL_ADDRESS", "PHONE_NUMBER", "LOCATION", "CREDIT_CARD", "CUSTOM_PII"],
-        language="en"
-    )
+uploaded = st.file_uploader("Upload files (multiple)", accept_multiple_files=True)
 
-    # Convert results to readable dict
-    readable_results = [
-        {
-            "entity": res.entity_type,
-            "score": round(res.score, 3),
-            "text": text[res.start:res.end],
-        }
-        for res in results
-    ]
-    return readable_results
+# Optionally allow user to run on server-local paths (for large files)
+st.write("Or list local file paths (one per line):")
+local_paths_input = st.text_area("Local file paths (optional)", height=80, placeholder="./data/file1.pdf\n./data/file2.csv")
 
+# Button to initialize pipeline with chosen settings
+if st.button("Initialize/Update Pipeline"):
+    # Recreate pipeline with new output dir/chunk settings
+    st.session_state.pipeline = get_pipeline(output_dir=out_dir, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+    # Update patterns in pipeline
+    # Remove previous regex classifier/anonymizer and re-register (simple approach: re-init pipeline)
+    # For simplicity, we will re-register regex patterns by creating a new pipeline instance
+    # NOTE: get_pipeline caches per args; to change patterns we manually register
+    p = st.session_state.pipeline
+    # Remove previously registered regex ones by re-creating pipeline would be ideal; here, just register new patterns
+    p.register_regex_patterns(st.session_state.regex_patterns.copy())
+    st.success("Pipeline initialized/updated. Patterns registered.")
 
-# -------------------------------------------------------------------------------------
-# Helper: Anonymize PII
-# -------------------------------------------------------------------------------------
+# lazy init if not already
+if "pipeline" not in st.session_state:
+    st.session_state.pipeline = get_pipeline(output_dir=out_dir, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+    # ensure patterns loaded
+    st.session_state.pipeline.register_regex_patterns(st.session_state.regex_patterns.copy())
 
-def anonymize_text(text, custom_regex=None, whitelist=None):
-    registry = RecognizerRegistry()
-    registry.load_predefined_recognizers()
+# Prepare sources list
+tmpdir = tempfile.mkdtemp(prefix="st_pipeline_")
+sources: List = []
+if uploaded:
+    st.write(f"Uploaded {len(uploaded)} file(s). Saving temporarily...")
+    for f in uploaded:
+        saved = save_uploaded_file(f, tmpdir)
+        sources.append(saved)
 
-    if custom_regex:
-        custom_recog = build_custom_regex_recognizer(custom_regex)
-        if custom_recog:
-            registry.add_recognizer(custom_recog)
+# include local paths
+if local_paths_input.strip():
+    lines = [l.strip() for l in local_paths_input.splitlines() if l.strip()]
+    for p in lines:
+        sources.append(p)
 
-    custom_analyzer = AnalyzerEngine(registry=registry)
-    results = custom_analyzer.analyze(text=text, language="en")
+st.write("Files to process:")
+if not sources:
+    st.info("No files selected yet. Upload files or add local paths, then click Run pipeline.")
+else:
+    for s in sources:
+        st.write(f"- {s}")
 
-    # Apply whitelist (ignore values)
-    if whitelist:
-        results = [r for r in results if text[r.start:r.end] not in whitelist]
+# Run the pipeline
+if st.button("Run pipeline"):
+    if not sources:
+        st.error("No files provided.")
+    else:
+        pipeline: DataPipeline = st.session_state.pipeline
+        # update regex patterns before run (ensure latest)
+        pipeline.register_regex_patterns(st.session_state.regex_patterns.copy())
 
-    anonymized = anonymizer.anonymize(text=text, analyzer_results=results)
-    return anonymized.text
+        st.info("Running pipeline — this may take a while for large files.")
+        # Run and show a progress bar
+        progress = st.progress(0)
+        results = []
+        try:
+            total = len(sources)
+            # run per-source to show partial progress
+            for i, src in enumerate(sources):
+                st.write(f"Processing: {src}")
+                res = pipeline.run_batch([src], save_outputs=True)
+                results.extend(res)
+                progress.progress(int((i + 1) / total * 100))
+            st.success("Pipeline run complete.")
+        except Exception as e:
+            st.exception(e)
+            st.error("Pipeline failed. See logs for details.")
 
-
-# -------------------------------------------------------------------------------------
-# File Handling Core Logic
-# -------------------------------------------------------------------------------------
-
-def process_file(file, custom_regex, whitelist, mode):
-    if file is None:
-        return "No file uploaded", None
-
-    whitelist_items = [w.strip() for w in whitelist.split(",")] if whitelist else []
-
-    name = file.name.lower()
-    data = file.read()
-
-    # --- CSV ---
-    if name.endswith(".csv"):
-        decoded = data.decode("utf-8")
-        reader = list(csv.reader(io.StringIO(decoded)))
-        header, rows = reader[0], reader[1:]
-
-        output_rows = []
-        for row in rows:
-            new_row = []
-            for cell in row:
-                if mode == "detect":
-                    new_row.append(str(detect_pii(cell, custom_regex)))
-                else:
-                    new_row.append(anonymize_text(cell, custom_regex, whitelist_items))
-            output_rows.append(new_row)
-
-        out_csv = io.StringIO()
-        writer = csv.writer(out_csv)
-        writer.writerow(header)
-        writer.writerows(output_rows)
-
-        return out_csv.getvalue(), out_csv.getvalue()
-
-    # --- JSON ---
-    elif name.endswith(".json"):
-        decoded = data.decode("utf-8")
-        json_data = json.loads(decoded)
-
-        def process_json(obj):
-            if isinstance(obj, dict):
-                return {k: process_json(v) for k, v in obj.items()}
-            if isinstance(obj, list):
-                return [process_json(x) for x in obj]
-            if isinstance(obj, str):
-                return detect_pii(obj, custom_regex) if mode == "detect" else anonymize_text(obj, custom_regex, whitelist_items)
-            return obj
-
-        processed = process_json(json_data)
-        result_str = json.dumps(processed, indent=2)
-
-        return result_str, result_str
-
-    # --- TXT ---
-    elif name.endswith(".txt"):
-        text = data.decode("utf-8")
-        if mode == "detect":
-            processed = detect_pii(text, custom_regex)
+        # Show results summary
+        st.header("Run Results Summary")
+        if not results:
+            st.warning("No metadata returned.")
         else:
-            processed = anonymize_text(text, custom_regex, whitelist_items)
-        return str(processed), str(processed)
+            for r in results:
+                with st.expander(f"Source: {r.get('source')} — Dominant: {r.get('dominant_type')}"):
+                    st.write("Document type:", r.get("doc_type"))
+                    st.write("Processed at:", r.get("processed_at"))
+                    st.write("Num chunks:", r.get("num_chunks"))
+                    st.write("Entity counts:", r.get("entity_counts"))
+                    # show chunk summaries
+                    st.write("Chunks (first 5):")
+                    for c in r.get("chunks", [])[:5]:
+                        st.markdown("----")
+                        st.write("Chunk metadata:", c.get("chunk_meta"))
+                        st.write("Text snippet:", c.get("text_snippet"))
+                        st.write("Classifications:")
+                        for clf in c.get("classifications", []):
+                            st.write(" -", clf.get("classifier"))
+                            # show up to 10 entities per classifier
+                            for ent in clf.get("results", [])[:10]:
+                                st.write("    •", ent.get("type"), "=>", (ent.get("value")[:120] + "...") if len(str(ent.get("value"))) > 120 else ent.get("value"))
 
-    # --- PDF ---
-    elif name.endswith(".pdf"):
-        return "PDF support present in your original code (presidio can't extract text reliably).", None
+                    st.markdown("### Anonymized versions (preview)")
+                    for name, anon_preview in r.get("anonymized_versions", {}).items():
+                        st.write(f"**{name}** (preview)")
+                        st.code(anon_preview[:2000])
+                        # full download button (load actual file from output_dir)
+                        base = Path(r.get("source")).name
+                        safe_base = re.sub(r"[^\w\-_.]", "_", base)
+                        file_path = Path(out_dir) / f"{safe_base}.{name}.anonymized.txt"
+                        if file_path.exists():
+                            with open(file_path, "r", encoding="utf-8") as f:
+                                content = f.read()
+                            st.download_button(f"Download {name} anonymized", data=content, file_name=f"{safe_base}.{name}.anonymized.txt")
+                        else:
+                            st.write("No file saved for this anonymizer.")
 
-    return "Unsupported file type", None
-
-
-# -------------------------------------------------------------------------------------
-# Gradio UI Logic
-# -------------------------------------------------------------------------------------
-
-def analyze_file(file, custom_regex, whitelist):
-    return process_file(file, custom_regex, whitelist, "detect")[0]
-
-
-def anonymize_file(file, custom_regex, whitelist):
-    return process_file(file, custom_regex, whitelist, "anonymize")[0]
-
-
-def quick_test(text, custom_regex, whitelist):
-    wl = [w.strip() for w in whitelist.split(",")] if whitelist else []
-    return anonymize_text(text, custom_regex, wl)
-
-
-# -------------------------------------------------------------------------------------
-# Build Gradio UI
-# -------------------------------------------------------------------------------------
-
-with gr.Blocks(title="PII Detection & Anonymization App") as app:
-
-    gr.Markdown("# 🔐 PII Detection & Anonymization (Presidio)")
-    gr.Markdown("Upload any file or enter text. Supports CSV, JSON, TXT, PDF.")
-
-    with gr.Row():
-        custom_regex = gr.Textbox(label="Custom Regex Pattern (optional)")
-        whitelist = gr.Textbox(label="Whitelist (comma-separated values)")
-
-    with gr.Tabs():
-
-        with gr.Tab("📁 Detect PII in File"):
-            file_input = gr.File(label="Upload File")
-            detect_btn = gr.Button("Detect PII")
-            detect_output = gr.Textbox(label="Detection Results", lines=15)
-
-            detect_btn.click(
-                analyze_file,
-                inputs=[file_input, custom_regex, whitelist],
-                outputs=[detect_output]
-            )
-
-        with gr.Tab("🛡 Anonymize File"):
-            file_input2 = gr.File(label="Upload File")
-            anonymize_btn = gr.Button("Anonymize File")
-            anonymize_output = gr.Textbox(label="Anonymized Output", lines=15)
-
-            anonymize_btn.click(
-                anonymize_file,
-                inputs=[file_input2, custom_regex, whitelist],
-                outputs=[anonymize_output]
-            )
-
-        with gr.Tab("⚡ Quick Test Text"):
-            input_text = gr.Textbox(label="Enter Text", lines=4)
-            quick_btn = gr.Button("Anonymize Text")
-            quick_output = gr.Textbox(label="Output", lines=6)
-
-            quick_btn.click(
-                quick_test,
-                inputs=[input_text, custom_regex, whitelist],
-                outputs=[quick_output]
-            )
-
-app.launch()
+# Footer
+st.markdown("---")
+st.write("Notes:")
+st.write("- Patterns you add are stored in your session only (not persisted to disk).")
+st.write("- For production, persist pattern store (DB) and allow versioning/audit of pattern changes.")
